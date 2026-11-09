@@ -11,7 +11,7 @@ import psutil
 
 N = 25
 SPEECH_PROB = 0.5
-INSTRUCTION = 'Answer in three or four short sentences. Each sentence must be under 15 words.'
+INSTRUCTION = 'Start with one very short sentence of under 8 words. Then add two or three short sentences, each under 15 words.'
 
 model = WhisperModel('small.en', device='cpu', compute_type='int8')
 voice = PiperVoice.load('en_US-lessac-medium.onnx')

@@ -51,6 +51,14 @@ voice = PiperVoice.load("en_US-lessac-medium.onnx")
 tts_load_ms = (time.perf_counter() - start_tts_load) * 1000
 print(f'Piper load time: {tts_load_ms:.1f} ms')
 
+# warm-up: load the LLM into memory and run the voice once, so the first question isn't slow
+start_warm = time.perf_counter()
+chat(model='llama3.2:1b', messages=[{'role': 'user', 'content': 'Hi'}],
+     options={'num_predict': 1}, keep_alive='30m')
+with wave.open('warmup.wav', 'wb') as wav_file:
+    voice.synthesize_wav('Hello.', wav_file)
+print(f'Warm-up time: {(time.perf_counter() - start_warm) * 1000:.0f} ms')
+
 #SileroVAD model integration
 
 while True:
@@ -102,7 +110,7 @@ while True:
 
   # transcribe straight from the array, no file
   start_asr = time.perf_counter()
-  segments, info = model.transcribe(audio, beam_size=5,language='en')
+  segments, info = model.transcribe(audio, beam_size=5,language='en',temperature=0.0)
   text = ''
   for segment in segments:
       text += segment.text
