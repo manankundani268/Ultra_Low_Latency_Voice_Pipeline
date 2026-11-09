@@ -1,6 +1,8 @@
 import sounddevice as sd
 import numpy as np
 import time
+import threading
+import collections
 from faster_whisper import WhisperModel
 from ollama import chat
 import wave
@@ -13,8 +15,32 @@ max_chunks = 470      # 470 chunks x 32 ms = about 15 s maximum per question
 N = 25                # silent chunks needed to end the question (25 x 32 = 800 ms)
 speech_prob = 0.5     # a chunk counts as speech at or above this VAD probability
 
+# barge-in rule: speech AND loud, 5 chunks in a row (5 x 32 ms = 160 ms)
+PROB_MIN = 0.9
+PEAK_MIN = 0.15
+NEEDED = 5
+PREROLL_CHUNKS = 16   # last 16 chunks (about 0.5 s) kept for later
 
-# ---------- Rung 3: sentence splitting ----------
+
+# ---------- the guard that listens while the assistant talks ----------
+def monitor(stream, stop_event, barge_event, preroll):
+    vad = SileroVAD(16000)
+    run = 0
+    while not stop_event.is_set():
+        chunk, overflowed = stream.read(512)
+        preroll.append(chunk)
+        p = vad.process(chunk.flatten())
+        k = np.abs(chunk).max()
+        if p >= PROB_MIN and k >= PEAK_MIN:
+            run += 1
+        else:
+            run = 0
+        if run >= NEEDED:
+            barge_event.set()      # ring the bell
+            return                 # guard goes home
+
+
+# ---------- sentence splitting ----------
 def split_sentences(text):
     sentences = []
     start = 0
@@ -36,29 +62,54 @@ def for_speech(s):
     return s.replace('\n', ' ')
 
 
-def speak(sentence):
+# ---------- speaking that can be interrupted ----------
+def is_playing():
+    # True while the speaker is still playing something
+    try:
+        return sd.get_stream().active
+    except RuntimeError:       # nothing has been played yet
+        return False
+
+
+def wait_playing(barge_event):
+    # wait until the speaker is done OR the bell rings (check every 10 ms)
+    while is_playing() and not barge_event.is_set():
+        time.sleep(0.01)
+
+
+def speak(sentence, barge_event):
     with wave.open('reply_part.wav', 'wb') as wav_file:
         voice.synthesize_wav(sentence, wav_file)
     data, rate = sf.read('reply_part.wav')
-    sd.wait()                 # let the previous sentence finish first
-    sd.play(data, rate)       # starts playing and returns immediately
+    wait_playing(barge_event)      # let the previous sentence finish first
+    if barge_event.is_set():
+        return                     # interrupted: do not start a new sentence
+    sd.play(data, rate)            # starts playing and returns immediately
 
 
-# ---------- Rung 4 (step 1): record one question from an already-open stream ----------
-def record_utterance(stream):
-    # throw away audio that piled up while we were busy (Whisper, LLM, playback)
-    waiting = stream.read_available
-    if waiting > 0:
-        stream.read(waiting)
-
+# ---------- record one question from an already-open stream ----------
+def record_utterance(stream, start_chunks=None):
     vad = SileroVAD(16000)    # fresh VAD for every question
     speech_started = False
     silent_count = 0
     chunks = []
 
+    if start_chunks is None:
+        # normal case: throw away audio that piled up while we were busy
+        waiting = stream.read_available
+        if waiting > 0:
+            stream.read(waiting)
+        pending = []
+    else:
+        # after an interruption: keep it, the saved chunks come first
+        pending = list(start_chunks)
+
     print('Recording started... speak now')
     for i in range(max_chunks):
-        chunk, overflowed = stream.read(512)
+        if pending:
+            chunk = pending.pop(0)            # replay a saved chunk
+        else:
+            chunk, overflowed = stream.read(512)
         chunks.append(chunk)
         prob = vad.process(chunk.flatten())
 
@@ -96,11 +147,15 @@ print(f'Warm-up time: {(time.perf_counter() - start_warm) * 1000:.0f} ms')
 
 # ---------- main loop: the mic stays open the whole time ----------
 with sd.InputStream(samplerate=16000, channels=1, blocksize=512) as stream:
+    
     for _ in range(16):       # discard mic start-up chunks, once
         stream.read(512)
 
+    carry = None
     while True:
+        print(f'carry chunks: {0 if carry is None else len(carry)}')
         chunks, speech_started, silent_count = record_utterance(stream)
+        carry = None
         if not speech_started:
             continue
 
@@ -134,8 +189,16 @@ with sd.InputStream(samplerate=16000, channels=1, blocksize=512) as stream:
         print(f'Heard: {text}')
         print(f'ASR time: {asr_ms:.1f} ms')
 
-        # LLM, speaking sentence by sentence
         instruction = 'Answer in three or four short sentences. Each sentence must be under 15 words.'
+
+        # start the guard BEFORE the assistant starts thinking and talking
+        stop_event = threading.Event()
+        barge_event = threading.Event()
+        preroll = collections.deque(maxlen=PREROLL_CHUNKS)
+        t = threading.Thread(target=monitor, args=(stream, stop_event, barge_event, preroll))
+        t.start()
+
+        # LLM, speaking sentence by sentence
         llm_stream = chat(
             model='llama3.2:1b',
             messages=[{'role': 'system', 'content': instruction},
@@ -146,21 +209,36 @@ with sd.InputStream(samplerate=16000, channels=1, blocksize=512) as stream:
         buffer = ''
         first_audio_ms = None
         for part in llm_stream:
+            if barge_event.is_set():
+                break                          # bell rang: stop reading the LLM
             piece = part.message.content
             print(piece, end='', flush=True)
             buffer = for_speech(buffer + piece)
             sentences, buffer = split_sentences(buffer)
             for sentence in sentences:
-                speak(sentence)
+                speak(sentence, barge_event)
+                if barge_event.is_set():
+                    break                      # bell rang: drop the other sentences
                 if first_audio_ms is None:
                     first_audio_ms = (time.perf_counter() - t_break) * 1000 + N * 32
 
-        leftover = buffer.strip()
-        if leftover:
-            speak(leftover)
-            if first_audio_ms is None:
-                first_audio_ms = (time.perf_counter() - t_break) * 1000 + N * 32
-        sd.wait()
+        if not barge_event.is_set():
+            leftover = buffer.strip()
+            if leftover:
+                speak(leftover, barge_event)
+                if first_audio_ms is None:
+                    first_audio_ms = (time.perf_counter() - t_break) * 1000 + N * 32
+            wait_playing(barge_event)          # let the last sentence finish
+
+        if barge_event.is_set():
+            sd.stop()                          # cut the voice right now
+
+        # send the guard home, and wait until he has left the mic
+        stop_event.set()
+        t.join()
+        if barge_event.is_set():
+            print('\nBARGE-IN detected: assistant stopped')
+            carry = list(preroll)
 
         print()
         if first_audio_ms is not None:
