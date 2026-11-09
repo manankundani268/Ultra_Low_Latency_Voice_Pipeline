@@ -154,7 +154,8 @@ with sd.InputStream(samplerate=16000, channels=1, blocksize=512) as stream:
     carry = None
     while True:
         print(f'carry chunks: {0 if carry is None else len(carry)}')
-        chunks, speech_started, silent_count = record_utterance(stream)
+        chunks, speech_started, silent_count = record_utterance(stream,carry
+                                                                )
         carry = None
         if not speech_started:
             continue
