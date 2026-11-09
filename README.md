@@ -57,7 +57,7 @@ Hardware: **[CPU / GPU / RAM]**
 
 - [x] **Rung 0:** audio capture, playback, and amplitude checks
 - [x] **Rung 1:** slow baseline (record → ASR → LLM → TTS) with per-stage timing
-- [ ] **Rung 2:** automatic turn-taking with VAD
+- [x] **Rung 2:** automatic turn-taking with VAD
 - [ ] **Rung 3:** streaming and sentence-level chunking
 - [ ] **Rung 4:** barge-in and echo handling
 - [ ] **Rung 5:** benchmarks over 50 utterances, optional GPU optimization
