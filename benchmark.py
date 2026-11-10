@@ -79,7 +79,7 @@ def run_once(audio):
     buffer = ''
     first_sentence = None
     first_sentence_ms = None
-    for piece in chat(model='llama3.2:1b', stream=True, options={'temperature': 0},
+    for piece in chat(model='llama3.2:3b', stream=True, options={'temperature': 0},
                       messages=[{'role': 'system', 'content': INSTRUCTION},
                                 {'role': 'user', 'content': text}]):
         reply += piece.message.content

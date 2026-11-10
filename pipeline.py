@@ -1,4 +1,5 @@
 # ---------- imports ----------
+import sys
 import sounddevice as sd
 import numpy as np
 import time
@@ -12,33 +13,51 @@ from piper import PiperVoice
 from silero_vad_lite import SileroVAD
 
 # ---------- settings ----------
+# model from the command line:  python pipeline.py llama3.2:3b
+# no argument means llama3.2:1b
+MODEL = sys.argv[1] if len(sys.argv) > 1 else 'llama3.2:1b'
+MEMORY_ON = True             # set False to turn memory off (latency test)
+
 max_chunks = 470
 N = 25
 speech_prob = 0.5
+min_speech_chunks = 12       # below this, the sound is treated as noise
 
 PROB_MIN = 0.9
 PEAK_MIN = 0.15
 NEEDED = 5
 PREROLL_CHUNKS = 16
 
+MAX_EXCHANGES = 3            # remember the last 3 question/answer pairs
+history = []                 # list of {'role', 'content'} messages
 
-# ---------- monitor thread ----------
-def monitor(stream, stop_event, barge_event, preroll, bell_time):  
+INSTRUCTION = (
+    "Answer in three or four short sentences. Each sentence must be under 15 words. "
+    "You are the assistant. You remember the user's details from earlier in this conversation. "
+    "Use them when asked. Never speak as the user."
+)
+
+
+# ---------- monitor thread (barge-in guard) ----------
+def monitor(stream, stop_event, barge_event, preroll, bell_time):
     vad = SileroVAD(16000)
     run = 0
-    while not stop_event.is_set():
-        chunk, overflowed = stream.read(512)
-        preroll.append(chunk)
-        p = vad.process(chunk.flatten())
-        k = np.abs(chunk).max()
-        if p >= PROB_MIN and k >= PEAK_MIN:
-            run += 1
-        else:
-            run = 0
-        if run >= NEEDED:
-            bell_time.append(time.perf_counter())  # NEW: record when bell rang
-            barge_event.set()
-            return
+    try:
+        while not stop_event.is_set():
+            chunk, overflowed = stream.read(512)
+            preroll.append(chunk)
+            p = vad.process(chunk.flatten())
+            k = np.abs(chunk).max()
+            if p >= PROB_MIN and k >= PEAK_MIN:
+                run += 1
+            else:
+                run = 0
+            if run >= NEEDED:
+                bell_time.append(time.perf_counter())
+                barge_event.set()
+                return
+    except Exception:
+        return   # stream closed under us (Ctrl+C): exit quietly
 
 
 # ---------- sentence splitting ----------
@@ -90,6 +109,7 @@ def record_utterance(stream, start_chunks=None):
     vad = SileroVAD(16000)
     speech_started = False
     silent_count = 0
+    speech_count = 0
     chunks = []
 
     if start_chunks is None:
@@ -112,29 +132,28 @@ def record_utterance(stream, start_chunks=None):
         if prob >= speech_prob:
             speech_started = True
             silent_count = 0
+            speech_count += 1
         else:
             silent_count += 1
 
         if speech_started and silent_count >= N:
             break
 
-    speech_count = sum(1 for prob in [vad.process(c.flatten()) for c in chunks] if prob >= 0.5)
     return chunks, speech_started, silent_count, speech_count
 
 
 # ---------- load models ----------
 start_load = time.perf_counter()
 model = WhisperModel('small.en', device='cpu', compute_type='int8')
-load_ms = (time.perf_counter() - start_load) * 1000
-print(f'Whisper load time: {load_ms:.1f} ms')
+print(f'Whisper load time: {(time.perf_counter() - start_load) * 1000:.1f} ms')
 
 start_tts_load = time.perf_counter()
 voice = PiperVoice.load("en_US-lessac-medium.onnx")
-tts_load_ms = (time.perf_counter() - start_tts_load) * 1000
-print(f'Piper load time: {tts_load_ms:.1f} ms')
+print(f'Piper load time: {(time.perf_counter() - start_tts_load) * 1000:.1f} ms')
 
+print(f'Model: {MODEL}   Memory: {"ON" if MEMORY_ON else "OFF"}')
 start_warm = time.perf_counter()
-chat(model='llama3.2:1b', messages=[{'role': 'user', 'content': 'Hi'}],
+chat(model=MODEL, messages=[{'role': 'user', 'content': 'Hi'}],
      options={'num_predict': 1}, keep_alive='30m')
 with wave.open('warmup.wav', 'wb') as wav_file:
     voice.synthesize_wav('Hello.', wav_file)
@@ -142,80 +161,60 @@ print(f'Warm-up time: {(time.perf_counter() - start_warm) * 1000:.0f} ms')
 
 
 # ---------- main loop ----------
-try:                                                   # NEW: catch Ctrl+C cleanly
+try:
     with sd.InputStream(samplerate=16000, channels=1, blocksize=512) as stream:
-
         for _ in range(16):
             stream.read(512)
 
         carry = None
         while True:
-            print(f'carry chunks: {0 if carry is None else len(carry)}')
-            chunks, speech_started, silent_count,speech_count = record_utterance(stream, carry)
+            chunks, speech_started, silent_count, speech_count = record_utterance(stream, carry)
             carry = None
             if not speech_started:
                 continue
-
-            if speech_count < 8:
+            if speech_count < min_speech_chunks:
+                print(f'Skipped: only {speech_count} speech chunks (need {min_speech_chunks})')
                 continue
 
-            print(f'Chunks collected: {len(chunks)}')
             print(f'Recorded duration: {len(chunks) * 32} ms')
-            print(f'Silent counts at the end: {silent_count}')
-
             t_break = time.perf_counter()
-            print('Recording finished')
 
-            audio = np.concatenate(chunks)
-            audio = audio.flatten()
+            audio = np.concatenate(chunks).flatten()
             if np.abs(audio).max() < 0.08:
                 continue
             sf.write('last_input.wav', audio, 16000)
-            print(f'Audio shape: {audio.shape}')
 
             start_asr = time.perf_counter()
             segments, info = model.transcribe(audio, beam_size=5, language='en', temperature=0.0)
-            text = ''
-            for segment in segments:
-                text += segment.text
+            text = ''.join(segment.text for segment in segments).strip()
             asr_ms = (time.perf_counter() - start_asr) * 1000
-
-            text = text.strip()
             if not text:
                 continue
 
-            device = sd.query_devices(kind='input')
-            print(f"Input Device: {device['name']}")
-            print(f'Peak level of the audio is: {np.abs(audio).max():.3f}')
             print(f'Heard: {text}')
             print(f'ASR time: {asr_ms:.1f} ms')
-
-            instruction = 'Answer in three or four short sentences. Each sentence must be under 15 words.'
 
             stop_event = threading.Event()
             barge_event = threading.Event()
             preroll = collections.deque(maxlen=PREROLL_CHUNKS)
-            bell_time = []                             # NEW: empty list for the bell time
-            t = threading.Thread(
-                target=monitor,
-                args=(stream, stop_event, barge_event, preroll, bell_time)  # NEW: pass bell_time
-            )
+            bell_time = []
+            t = threading.Thread(target=monitor, args=(stream, stop_event, barge_event, preroll, bell_time))
             t.start()
 
-            llm_stream = chat(
-                model='llama3.2:1b',
-                messages=[{'role': 'system', 'content': instruction},
-                          {'role': 'user', 'content': text}],
-                stream=True,
-            )
+            # the LLM sees: instruction, the saved exchanges (if memory is on), then the new question
+            past = history if MEMORY_ON else []
+            messages = [{'role': 'system', 'content': INSTRUCTION}] + past + [{'role': 'user', 'content': text}]
+            llm_stream = chat(model=MODEL, messages=messages, stream=True)
 
             buffer = ''
+            full_reply = ''
             first_audio_ms = None
             for part in llm_stream:
                 if barge_event.is_set():
                     break
                 piece = part.message.content
                 print(piece, end='', flush=True)
+                full_reply += piece
                 buffer = for_speech(buffer + piece)
                 sentences, buffer = split_sentences(buffer)
                 for sentence in sentences:
@@ -235,20 +234,28 @@ try:                                                   # NEW: catch Ctrl+C clean
 
             if barge_event.is_set():
                 sd.stop()
-                if bell_time:                          # NEW: reaction time
-                    reaction_ms = (time.perf_counter() - bell_time[0]) * 1000
-                    print(f'\nBarge-in reaction time: {reaction_ms:.0f} ms')
 
             stop_event.set()
             t.join()
+
+            # save the exchange only if the answer finished, then cap the history
+            if MEMORY_ON:
+                if not barge_event.is_set() and full_reply.strip():
+                    history.append({'role': 'user', 'content': text})
+                    history.append({'role': 'assistant', 'content': full_reply.strip()})
+                    history[:] = history[-2 * MAX_EXCHANGES:]
+                    print(f'[memory: {len(history) // 2} exchange(s) saved]')
+                elif barge_event.is_set():
+                    print('[memory: interrupted answer NOT saved]')
+
             if barge_event.is_set():
-                print('BARGE-IN detected: assistant stopped')
+                print('\nBARGE-IN detected: assistant stopped')
                 carry = list(preroll)
 
             print()
             if first_audio_ms is not None:
                 print(f'Voice-to-voice (first audio): {first_audio_ms:.1f} ms')
 
-except KeyboardInterrupt:                              # NEW: clean exit
+except KeyboardInterrupt:
     sd.stop()
     print('\nStopped.')
